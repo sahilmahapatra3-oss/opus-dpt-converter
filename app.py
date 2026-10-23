@@ -1,4 +1,3 @@
-
 import io
 import tempfile
 import zipfile
@@ -10,27 +9,42 @@ from brukeropusreader import read_file
 
 
 st.set_page_config(
-    page_title="Bruker OPUS Absorbance to DPT Converter",
+    page_title="Bruker OPUS to DPT Converter",
     page_icon="📈",
     layout="centered",
 )
 
 st.title("Bruker OPUS → DPT Bulk Converter")
 
+# Select which spectrum to export.
+spectrum_options = {
+    "Transmittance (TR)": "TR",
+    "Absorbance (AB)": "AB",
+}
+
+spectrum_label = st.selectbox(
+    "1. Select the spectrum you want to export",
+    options=list(spectrum_options.keys()),
+    index=0,
+)
+
+spectrum_code = spectrum_options[spectrum_label]
+
 st.write(
-    "Upload multiple original Bruker OPUS files. The app extracts the "
-    "AB (absorbance) spectrum and its wavenumber axis directly from "
-    "each OPUS file, then converts the data into DPT text files."
+    f"Upload multiple original Bruker OPUS files. "
+    f"The app extracts the selected {spectrum_label} spectrum "
+    f"and its wavenumber axis directly from each OPUS file."
 )
 
 st.info(
-    "No reference DPT file is required. The app extracts the absorbance "
-    "axis independently from each OPUS file. A file must contain a usable "
-    "AB spectrum and matching wavenumber axis to be converted."
+    f"No reference DPT file is required. The app extracts the "
+    f"{spectrum_code} spectrum and its wavenumber axis from each file. "
+    "Files that do not contain a usable spectrum or corresponding axis "
+    "will be reported as failed."
 )
 
 opus_files = st.file_uploader(
-    "1. Select your original OPUS files",
+    "2. Select your original OPUS files",
     accept_multiple_files=True,
     help=(
         "Select multiple original Bruker OPUS binary files. "
@@ -41,7 +55,7 @@ opus_files = st.file_uploader(
 
 
 def unique_output_name(original_name, counts):
-    """Create unique output filenames while preserving recognizable names."""
+    """Create unique DPT filenames while retaining recognizable names."""
     base = Path(original_name.replace("\\", "/")).name or "opus_file"
 
     counts[base] = counts.get(base, 0) + 1
@@ -53,7 +67,7 @@ def unique_output_name(original_name, counts):
 
 
 if st.button(
-    "Convert OPUS absorbance files to DPT",
+    f"Convert {spectrum_label} files to DPT",
     type="primary",
     disabled=not opus_files,
 ):
@@ -80,76 +94,80 @@ if st.button(
                 # Save the uploaded OPUS binary temporarily.
                 input_path.write_bytes(uploaded.getvalue())
 
-                # Read the OPUS file.
+                # Read the original OPUS file.
                 opus_data = read_file(str(input_path))
 
-                # Verify that the absorbance block exists.
-                if "AB" not in opus_data:
+                # Check that the selected spectrum exists.
+                if spectrum_code not in opus_data:
                     available = ", ".join(
                         map(str, list(opus_data.keys())[:25])
                     )
 
                     raise ValueError(
-                        "This OPUS file does not contain an AB "
-                        "(absorbance) spectrum. "
+                        f"This OPUS file does not contain the selected "
+                        f"{spectrum_label} block ({spectrum_code}). "
                         f"Available fields: {available or 'none'}. "
-                        "Check that absorbance data was acquired or "
-                        "saved in this OPUS file."
+                        "Check whether this spectrum is present in the "
+                        "original OPUS file."
                     )
 
-                # Extract the absorbance wavenumber axis.
+                # Extract the wavenumber axis for the selected spectrum.
                 try:
-                    x_values = opus_data.get_range("AB")
+                    x_values = opus_data.get_range(spectrum_code)
                 except Exception as exc:
                     raise ValueError(
-                        f"Could not extract the AB wavenumber axis: {exc}"
+                        f"Could not extract the {spectrum_code} "
+                        f"wavenumber axis: {exc}"
                     ) from exc
 
                 if x_values is None or len(x_values) == 0:
                     raise ValueError(
-                        "The OPUS reader returned an empty AB wavenumber axis."
+                        f"The OPUS reader returned an empty "
+                        f"{spectrum_code} wavenumber axis."
                     )
 
-                # Extract absorbance intensities.
-                y_raw = opus_data["AB"]
+                # Extract the selected spectrum's intensity values.
+                y_raw = opus_data[spectrum_code]
 
                 try:
                     y_count = len(y_raw)
                 except TypeError as exc:
                     raise ValueError(
-                        "The AB absorbance data is not a usable sequence."
+                        f"The {spectrum_code} spectrum is not "
+                        "a usable sequence."
                     ) from exc
 
-                # Ensure sufficient intensity values are available.
+                # Ensure the spectrum has enough values for its axis.
                 if y_count < len(x_values):
                     raise ValueError(
-                        f"Axis/data length mismatch: the AB wavenumber "
-                        f"axis contains {len(x_values)} points, but the "
-                        f"absorbance block contains {y_count} values."
+                        f"Axis/data length mismatch: the axis contains "
+                        f"{len(x_values)} points, but the "
+                        f"{spectrum_code} spectrum contains "
+                        f"{y_count} values."
                     )
 
-                # AB can have extra trailing values; retain only the
-                # intensity values corresponding to the wavenumber axis.
+                # Some OPUS blocks can contain trailing extra values.
+                # Retain the number of values defined by the axis.
                 y_values = y_raw[:len(x_values)]
 
                 if len(y_values) != len(x_values):
                     raise ValueError(
-                        "Could not align AB intensities with the "
-                        "wavenumber axis."
+                        f"Could not align {spectrum_code} intensities "
+                        "with their wavenumber axis."
                     )
 
-                # Check that the axis contains numeric values.
+                # Validate that wavenumbers are numeric.
                 try:
                     for x_value in x_values:
                         float(x_value)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
-                        "The extracted AB wavenumber axis contains "
+                        "The extracted wavenumber axis contains "
                         "non-numeric values."
                     ) from exc
 
-                # Export wavenumber, absorbance pairs.
-                # Preserve five decimal places and half-even rounding.
+                # Create wavenumber,intensity pairs.
+                # Keep five decimal places with half-even rounding.
                 output_lines = []
 
                 for x_value, y_value in zip(x_values, y_values):
@@ -179,6 +197,7 @@ if st.button(
                 text=f"Processed {index} of {total} file(s)...",
             )
 
+    # Display the results.
     st.subheader("Conversion report")
 
     col1, col2 = st.columns(2)
@@ -211,17 +230,17 @@ if st.button(
                 )
 
         st.download_button(
-            "Download converted absorbance DPT files (ZIP)",
+            f"Download {spectrum_label} DPT files (ZIP)",
             data=zip_buffer.getvalue(),
-            file_name="converted_absorbance_dpt_files.zip",
+            file_name=f"converted_{spectrum_code.lower()}_dpt_files.zip",
             mime="application/zip",
             type="primary",
         )
 
         st.success(
-            "Conversion completed. Compare at least one result with "
-            "an absorbance DPT exported directly from OPUS before "
-            "using these files for research."
+            f"Conversion completed for the selected {spectrum_label}. "
+            "Compare at least one result with a DPT exported directly "
+            "from OPUS before using the data in research."
         )
 
     else:
@@ -241,8 +260,8 @@ if st.button(
 st.divider()
 
 st.caption(
-    "The AB absorbance spectrum and its wavenumber axis are extracted "
-    "directly from each OPUS file. Intensities are exported to five "
-    "decimal places using ROUND_HALF_EVEN rounding. Validate the "
+    f"The selected {spectrum_label} spectrum and its wavenumber axis "
+    "are extracted from each OPUS file. Intensities are exported to "
+    "five decimal places using ROUND_HALF_EVEN rounding. Validate the "
     "output against OPUS before quantitative analysis."
 )
