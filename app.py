@@ -1,5 +1,4 @@
 import io
-import os
 import tempfile
 import zipfile
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -8,139 +7,205 @@ from pathlib import Path
 import streamlit as st
 from brukeropusreader import read_file
 
-st.set_page_config(page_title="Bruker OPUS → DPT Converter", page_icon="📈", layout="centered")
 
-st.title("Bruker OPUS → DPT Bulk Converter")
-st.write(
-    "Upload multiple Bruker OPUS files and convert their **ScSm (single-channel sample spectrum)** "
-    "data to DPT text files. This web app follows the extraction and rounding approach of the "
-    "original GitHub script."
+st.set_page_config(
+    page_title="Bruker OPUS to DPT Converter",
+    page_icon="📈",
+    layout="centered",
 )
 
-st.warning(
-    "The original script takes the wavenumber axis from a manually exported DPT template. "
-    "Upload a template exported from OPUS that has the same axis/range/number of points as the files "
-    "you are converting. The app checks that the number of X and Y values matches; it cannot prove "
-    "the template axis matches the uploaded OPUS files scientifically."
+st.title("Bruker OPUS → DPT Bulk Converter")
+
+st.write(
+    "Upload multiple original Bruker OPUS files. The app extracts the "
+    "ScSm single-channel sample spectrum and its wavenumber axis directly "
+    "from each OPUS file, then converts the data into DPT text files."
+)
+
+st.info(
+    "No reference DPT file is required. The wavenumber axis is extracted "
+    "independently from every OPUS file. Files that do not contain a usable "
+    "ScSm spectrum or corresponding axis will be reported as failed."
 )
 
 opus_files = st.file_uploader(
-    "1. Select OPUS binary files (you can select multiple files)",
+    "1. Select your original OPUS files",
     accept_multiple_files=True,
-    help="Upload the original binary OPUS files, including files with extensions such as .0 or .0001. Do not upload exported CSV/DPT files here.",
+    help=(
+        "Select multiple original Bruker OPUS binary files. "
+        "Files may have extensions such as .0 or .0001. "
+        "Do not upload previously exported DPT or CSV files."
+    ),
 )
-template_file = st.file_uploader(
-    "2. Upload a reference .DPT template exported from OPUS",
-    accept_multiple_files=False,
-    help="The template must contain one wavenumber,intensity pair per line, like the original converter expects.",
-)
 
 
-def read_x_axis(template_bytes: bytes):
-    text = template_bytes.decode("utf-8-sig", errors="replace")
-    x_values = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        if "," not in line:
-            raise ValueError(
-                f"The reference DPT does not look like comma-separated X,Y data (line {line_number}). "
-                "Export a standard DPT from OPUS containing wavenumber,intensity on each line."
-            )
-        x_text = line.split(",", 1)[0].strip()
-        try:
-            float(x_text)
-        except ValueError as exc:
-            raise ValueError(
-                f"Could not read the wavenumber in the reference DPT at line {line_number}: {x_text!r}. "
-                "Use a numeric DPT file without a column-header row."
-            ) from exc
-        x_values.append(x_text)
-    if not x_values:
-        raise ValueError("The reference DPT contains no usable wavenumber values.")
-    return x_values
-
-
-def unique_output_name(original_name: str, counts: dict[str, int]) -> str:
-    # Avoid folder traversal and keep the uploaded file's recognizable name.
+def unique_output_name(original_name, counts):
+    """Create unique output filenames while preserving recognizable names."""
     base = Path(original_name.replace("\\", "/")).name or "opus_file"
+
     counts[base] = counts.get(base, 0) + 1
-    suffix = ".dpt"
-    candidate = base + suffix
-    if counts[base] > 1:
-        candidate = f"{base}_{counts[base]}{suffix}"
-    return candidate
+
+    if counts[base] == 1:
+        return base + ".dpt"
+
+    return f"{base}_{counts[base]}.dpt"
 
 
-if st.button("Convert OPUS files to DPT", type="primary", disabled=not opus_files or not template_file):
-    try:
-        x_values = read_x_axis(template_file.getvalue())
-    except Exception as exc:
-        st.error(f"Could not read the reference DPT: {exc}")
-        st.stop()
-
+if st.button(
+    "Convert OPUS files to DPT",
+    type="primary",
+    disabled=not opus_files,
+):
     results = []
     failures = []
     name_counts = {}
-    progress = st.progress(0, text="Preparing files…")
+
+    progress = st.progress(0, text="Preparing files...")
 
     with tempfile.TemporaryDirectory(prefix="opus_dpt_") as temp_dir:
         total = len(opus_files)
+
         for index, uploaded in enumerate(opus_files, start=1):
-            original_name = Path(uploaded.name.replace("\\", "/")).name or f"opus_file_{index}"
-            input_path = Path(temp_dir) / f"input_{index}_{original_name}"
+            original_name = (
+                Path(uploaded.name.replace("\\", "/")).name
+                or f"opus_file_{index}"
+            )
+
+            input_path = (
+                Path(temp_dir) / f"input_{index}_{original_name}"
+            )
+
             try:
+                # Save the uploaded binary temporarily for the OPUS reader.
                 input_path.write_bytes(uploaded.getvalue())
+
+                # Read the original Bruker OPUS file.
                 opus_data = read_file(str(input_path))
 
+                # Check that the requested spectrum exists.
                 if "ScSm" not in opus_data:
-                    available = ", ".join(map(str, list(opus_data.keys())[:25]))
-                    raise KeyError(
-                        "This OPUS file has no 'ScSm' spectrum. "
-                        f"Fields found (first 25): {available or 'none'}"
+                    available = ", ".join(
+                        map(str, list(opus_data.keys())[:25])
                     )
 
-                y_values = opus_data["ScSm"]
-                try:
-                    y_count = len(y_values)
-                except TypeError as exc:
-                    raise ValueError("The ScSm data block is not a one-dimensional sequence.") from exc
-
-                if len(x_values) != y_count:
                     raise ValueError(
-                        f"Axis length mismatch: template has {len(x_values)} wavenumbers, "
-                        f"but ScSm contains {y_count} intensity values. No DPT was written for this file."
+                        "The OPUS file does not contain a ScSm spectrum. "
+                        f"Available fields: {available or 'none'}"
                     )
 
-                output_name = unique_output_name(original_name, name_counts)
+                # Extract the wavenumber axis directly from this OPUS file.
+                try:
+                    x_values = opus_data.get_range("ScSm")
+                except Exception as exc:
+                    raise ValueError(
+                        f"Could not extract the ScSm wavenumber axis: {exc}"
+                    ) from exc
+
+                if x_values is None or len(x_values) == 0:
+                    raise ValueError(
+                        "The OPUS reader returned an empty ScSm wavenumber axis."
+                    )
+
+                # Extract the single-channel sample intensity data.
+                y_raw = opus_data["ScSm"]
+
+                try:
+                    y_count = len(y_raw)
+                except TypeError as exc:
+                    raise ValueError(
+                        "The ScSm intensity data is not a usable sequence."
+                    ) from exc
+
+                # Fail if there are fewer intensities than axis points.
+                if y_count < len(x_values):
+                    raise ValueError(
+                        f"Axis/data length mismatch: the wavenumber axis "
+                        f"contains {len(x_values)} points, but the spectrum "
+                        f"contains only {y_count} intensity values."
+                    )
+
+                # The reader can return extra trailing data values.
+                # Keep exactly the number of values defined by the axis.
+                y_values = y_raw[:len(x_values)]
+
+                if len(y_values) != len(x_values):
+                    raise ValueError(
+                        "Could not align the ScSm intensity values "
+                        "with their wavenumber axis."
+                    )
+
+                # Check that the extracted axis values are numeric.
+                try:
+                    for x_value in x_values:
+                        float(x_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "The extracted wavenumber axis contains "
+                        "non-numeric values."
+                    ) from exc
+
+                # Write wavenumber,intensity pairs.
+                # Preserve the original five-decimal, half-even rounding.
                 output_lines = []
+
                 for x_value, y_value in zip(x_values, y_values):
                     y_rounded = Decimal(str(y_value)).quantize(
-                        Decimal(".00001"), rounding=ROUND_HALF_EVEN
+                        Decimal("0.00001"),
+                        rounding=ROUND_HALF_EVEN,
                     )
-                    output_lines.append(f"{x_value},{y_rounded}\n")
+
+                    output_lines.append(
+                        f"{x_value},{y_rounded}\n"
+                    )
+
                 output_bytes = "".join(output_lines).encode("utf-8")
+
+                output_name = unique_output_name(
+                    original_name,
+                    name_counts,
+                )
+
                 results.append((output_name, output_bytes))
+
             except Exception as exc:
                 failures.append((original_name, str(exc)))
-            progress.progress(index / total, text=f"Processed {index} of {total} file(s)…")
+
+            progress.progress(
+                index / total,
+                text=f"Processed {index} of {total} file(s)...",
+            )
 
     st.subheader("Conversion report")
+
     col1, col2 = st.columns(2)
     col1.metric("Converted successfully", len(results))
     col2.metric("Failed", len(failures))
 
     if results:
         zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+
+        with zipfile.ZipFile(
+            zip_buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
             for output_name, output_bytes in results:
                 zip_file.writestr(output_name, output_bytes)
+
             if failures:
-                report = "Files that failed conversion\n\n" + "\n".join(
-                    f"{name}: {reason}" for name, reason in failures
+                report = (
+                    "Files that failed conversion\n\n"
+                    + "\n".join(
+                        f"{name}: {reason}"
+                        for name, reason in failures
+                    )
                 )
-                zip_file.writestr("conversion_errors.txt", report)
+
+                zip_file.writestr(
+                    "conversion_errors.txt",
+                    report,
+                )
+
         st.download_button(
             "Download converted DPT files (ZIP)",
             data=zip_buffer.getvalue(),
@@ -148,17 +213,32 @@ if st.button("Convert OPUS files to DPT", type="primary", disabled=not opus_file
             mime="application/zip",
             type="primary",
         )
-        st.success("The ZIP is ready. Validate at least one result against a DPT exported directly from OPUS before using it for research.")
+
+        st.success(
+            "Conversion completed. Compare at least one exported spectrum "
+            "with a DPT file exported directly from OPUS before using "
+            "the results in research."
+        )
+
     else:
-        st.error("No files were converted successfully. Read the failure messages below.")
+        st.error(
+            "No files were converted successfully. "
+            "Expand the failure report below."
+        )
 
     if failures:
-        with st.expander("Show failed files and reasons", expanded=True):
+        with st.expander(
+            "Show failed files and reasons",
+            expanded=True,
+        ):
             for name, reason in failures:
                 st.write(f"**{name}** — {reason}")
 
 st.divider()
+
 st.caption(
-    "Scientific validation note: the converter preserves the original script's ScSm extraction and "
-    "5-decimal ROUND_HALF_EVEN formatting. A matching reference DPT axis is still required."
+    "The wavenumber axis is extracted using the OPUS reader for each file. "
+    "ScSm intensities are exported with five decimal places using "
+    "ROUND_HALF_EVEN rounding. Always validate the exported data against "
+    "OPUS before quantitative analysis."
 )
