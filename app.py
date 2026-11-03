@@ -52,30 +52,78 @@ def _params(b, off, words):
     return P
 
 
+def _opus_type_info(key):
+    """Decode the 32-bit OPUS block type word stored in the directory."""
+    word = int.from_bytes(bytes(key), byteorder='little', signed=False)
+    # Bit 30 is set on some OPUS blocks but is not part of the block identity.
+    word &= ~(1 << 30)
+    return {
+        'word': word,
+        'part': word & 0x03,
+        'role': (word >> 2) & 0x03,
+        'params': (word >> 4) & 0x3F,
+        'data_kind': (word >> 10) & 0x7F,
+        'derivative': (word >> 17) & 0x03,
+        'extended': (word >> 19) & 0x07,
+    }
+
+
 def parse_opus(data):
-    """Return list of spectral data blocks: dict(key, nu, y, P). Axis = FXV..LXV."""
+    """Return spectral data blocks, using the OPUS type word and status block."""
     if not is_opus(data):
         raise ValueError('not an OPUS file (magic number 0A0AFEFE missing)')
+
     ents = _read_dir(data)
+    # Normalize the OPUS block type words (including the optional bit-30 flag)
+    # so each data block can be paired with its corresponding status block.
+    entries_by_word = {}
+    for key, value in ents.items():
+        word = _opus_type_info(key)['word']
+        entries_by_word.setdefault(word, value)
+
     out = []
     for key, (words, off) in ents.items():
-        t0 = key[0]
-        if t0 == 0 or t0 >= 16:            # parameter / text / directory blocks
+        info = _opus_type_info(key)
+
+        # params=0 identifies a data block. Its matching status block has
+        # params=1; the other type-word fields remain unchanged.
+        if info['params'] != 0 or info['data_kind'] == 0:
             continue
-        pk = (t0 + 16,) + key[1:]          # its "data status" parameter block
-        if pk not in ents:
+        # Ignore imaginary-only components; use plain data or the real part.
+        if info['part'] == 2:
             continue
-        P = _params(data, ents[pk][1], ents[pk][0])
+
+        status_word = (info['word'] & ~(0x3F << 4)) | (1 << 4)
+        if status_word not in entries_by_word:
+            continue
+
+        status_words, status_off = entries_by_word[status_word]
+        P = _params(data, status_off, status_words)
         n = P.get('NPT')
-        if not isinstance(n, int) or n < 10 or n * 4 > words * 4:
+        if not isinstance(n, int) or n < 10:
             continue
         if 'FXV' not in P or 'LXV' not in P:
             continue
-        y = np.frombuffer(data[off:off + 4 * n], dtype='<f4').astype(float) * float(P.get('CSF', 1.0) or 1.0)
-        nu = np.linspace(P['FXV'], P['LXV'], n)
-        out.append(dict(key=key[:2], nu=nu, y=y, P=P))
-    return out
 
+        # DPF=1 is float32 (the format in the supplied OPUS sample); DPF=2
+        # is int32. Retain float32 as the fallback for older/unspecified files.
+        dpf = P.get('DPF', 1)
+        dtype = '<i4' if dpf == 2 else '<f4'
+        itemsize = np.dtype(dtype).itemsize
+        if n * itemsize > words * 4:
+            continue
+        y = np.frombuffer(
+            data[off:off + itemsize * n], dtype=dtype, count=n
+        ).astype(float)
+        y *= float(P.get('CSF', 1.0) or 1.0)
+        nu = np.linspace(float(P['FXV']), float(P['LXV']), n)
+
+        out.append(dict(
+            key=key[:2], nu=nu, y=y, P=P,
+            block_type=info,
+        ))
+
+    return out
 
 def _interp(nu_to, blk):
     nu, y = blk['nu'], blk['y']
@@ -85,8 +133,48 @@ def _interp(nu_to, blk):
 
 
 def classify(blocks):
-    """Decide which block is sample / reference / TR / AB from the numbers."""
+    """Identify spectrum types from OPUS block-type metadata, with numeric fallback."""
     roles, notes = {}, []
+
+    # OPUS type-word fields explicitly encode spectrum role and data kind:
+    # role 1=sample, 2=reference, 3=result; data kind 4=AB, 5=TR.
+    role_candidates = {'sample': [], 'reference': []}
+    result_candidates = {'AB': [], 'TR': [], 'TR_percent': []}
+
+    for i, b in enumerate(blocks):
+        info = b.get('block_type', {})
+        opus_role = info.get('role')
+        data_kind = info.get('data_kind')
+        part = info.get('part', 0)
+
+        if opus_role == 1:
+            role_candidates['sample'].append((data_kind == 1, part == 3, i))
+        elif opus_role == 2:
+            role_candidates['reference'].append((data_kind == 1, part == 3, i))
+
+        if data_kind == 4:
+            result_candidates['AB'].append((opus_role == 3, part == 3, i))
+        elif data_kind == 5:
+            # OPUS stores transmittance as either a fraction or percent in
+            # different workflows. Detect percent-scale data conservatively.
+            ymax = float(np.nanmax(np.abs(b['y']))) if b['y'].size else 0.0
+            target = 'TR_percent' if ymax > 2.0 else 'TR'
+            result_candidates[target].append((opus_role == 3, part == 3, i))
+
+    for name, candidates in role_candidates.items():
+        if candidates:
+            roles[name] = max(candidates)[2]
+    for name, candidates in result_candidates.items():
+        if candidates:
+            roles[name] = max(candidates)[2]
+
+    if any(name in roles for name in ('AB', 'TR', 'TR_percent')):
+        notes.append('spectrum type identified from the OPUS block type word')
+    if 'sample' in roles or 'reference' in roles:
+        notes.append('sample/reference roles identified from the OPUS block type word')
+
+    # Keep the previous numerical relationship check as a fallback for OPUS
+    # variants where the block type does not identify the result spectrum.
     n = len(blocks)
     for ri in range(n):
         R = blocks[ri]
@@ -111,14 +199,18 @@ def classify(blocks):
                     continue
                 if kind not in roles:
                     roles[kind] = ri
-                if 'sample' not in roles:
+                if 'sample' not in roles and 'reference' not in roles:
                     roles['sample'], roles['reference'] = xi, yi
                     notes.append('sample/reference identified because the result block equals sample/reference')
-    if 'sample' not in roles:
+
+    # Preserve the original fallback for files with legacy sample/reference keys.
+    if 'sample' not in roles or 'reference' not in roles:
         d = {b['key'][0]: i for i, b in enumerate(blocks)}
         if 7 in d and 11 in d:
-            roles['sample'], roles['reference'] = d[7], d[11]
+            roles.setdefault('sample', d[7])
+            roles.setdefault('reference', d[11])
             notes.append('sample/reference ASSUMED from OPUS block codes 7 / 11 (no result block to verify)')
+
     return roles, notes
 
 
