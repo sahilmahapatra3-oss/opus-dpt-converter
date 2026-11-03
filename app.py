@@ -261,8 +261,30 @@ QUANTITIES = {
 
 
 def get_quantity(S, q):
-    """return (nu, y, source_note). Never applies 10^-A to a block that is not verified AB."""
+    """Return (nu, y, source_note), using block metadata as a direct fallback."""
     B, R = S['blocks'], S['roles']
+
+    def direct_block(kind):
+        """Find a stored result block even if classify() did not add its role."""
+        # First use the classifier's result, if present.
+        if kind in R and 0 <= R[kind] < len(B):
+            return B[R[kind]]
+
+        # Then inspect the OPUS data-kind field decoded from the directory key.
+        # In the supplied RM_0-00675.45 file, data_kind=4 means stored AB.
+        wanted_kind = {'AB': 4, 'TR': 5}.get(kind)
+        if wanted_kind is not None:
+            for block in B:
+                info = block.get('block_type', {})
+                if info.get('data_kind') == wanted_kind:
+                    return block
+
+        # Legacy OPUS files can also carry the result type in the status block.
+        for block in B:
+            plf = str(block.get('P', {}).get('PLF', '')).strip().upper()
+            if plf == kind:
+                return block
+        return None
 
     def ratio():
         if 'sample' in R and 'reference' in R:
@@ -273,26 +295,34 @@ def get_quantity(S, q):
 
     if q in ('TR', 'TRP'):
         f = 1.0 if q == 'TR' else 100.0
-        if 'TR' in R:
-            b = B[R['TR']]; return b['nu'], b['y'] * f, 'stored transmittance block (verified = sample/reference)'
+        b = direct_block('TR')
+        if b is not None:
+            return b['nu'], b['y'] * f, 'stored transmittance block (identified from OPUS metadata)'
         if 'TR_percent' in R:
-            b = B[R['TR_percent']]; return b['nu'], b['y'] / 100 * f, 'stored %T block (verified), converted'
+            b = B[R['TR_percent']]
+            return b['nu'], b['y'] / 100 * f, 'stored %T block (verified), converted'
         rr = ratio()
         if rr is not None:
             return rr[0], rr[1] * f, 'calculated sample / reference'
-        if 'AB' in R:
-            b = B[R['AB']]; return b['nu'], 10 ** (-b['y']) * f, 'calculated from verified AB block, T = 10^(-A)'
+        b = direct_block('AB')
+        if b is not None:
+            return b['nu'], 10 ** (-b['y']) * f, 'calculated from stored absorbance, T = 10^(-A)'
         raise ValueError('cannot obtain transmittance from this file')
+
     if q == 'AB':
-        if 'AB' in R:
-            b = B[R['AB']]; return b['nu'], b['y'], 'stored absorbance block (verified)'
+        b = direct_block('AB')
+        if b is not None:
+            return b['nu'], b['y'], 'stored absorbance block (identified from OPUS metadata)'
         nu, t, src = get_quantity(S, 'TR')
         return nu, -np.log10(np.clip(t, 1e-9, None)), 'calculated A = -log10(T) from ' + src
+
     if q in ('SM', 'RF'):
         k = 'sample' if q == 'SM' else 'reference'
         if k not in R:
             raise ValueError('no %s single-channel block identified' % k)
-        b = B[R[k]]; return b['nu'], b['y'], 'single-channel block'
+        b = B[R[k]]
+        return b['nu'], b['y'], 'single-channel block'
+
     raise ValueError('unknown quantity ' + q)
 
 
